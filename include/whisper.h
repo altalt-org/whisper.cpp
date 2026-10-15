@@ -423,6 +423,12 @@ extern "C" {
     WHISPER_API float * whisper_get_logits           (struct whisper_context * ctx);
     WHISPER_API float * whisper_get_logits_from_state(struct whisper_state * state);
 
+    // External (Core ML / OpenVINO) encoder runs on the context's default state
+    // that failed, or whose output had NaN/Inf, |x| > 1e4 or was all zeros. Cumulative:
+    // diff two reads to scope them to one whisper_full() call.
+    WHISPER_API int whisper_n_encode_ext_failed(struct whisper_context * ctx);
+    WHISPER_API int whisper_n_encode_ext_bad   (struct whisper_context * ctx);
+
     // Token Id -> String. Uses the vocabulary in the provided context
     WHISPER_API const char * whisper_token_to_str(struct whisper_context * ctx, whisper_token token);
     WHISPER_API const char * whisper_model_type_readable(struct whisper_context * ctx);
