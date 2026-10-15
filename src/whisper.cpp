@@ -879,6 +879,10 @@ struct whisper_state {
     struct ggml_tensor * embd_conv = nullptr;
     struct ggml_tensor * embd_enc  = nullptr;
 
+    // external (Core ML / OpenVINO) encoder runs, cumulative over the state's lifetime
+    int32_t n_encode_ext_failed = 0; // the encoder threw; embd_enc kept the previous window
+    int32_t n_encode_ext_bad    = 0; // embd_enc came back with NaN/Inf, |x| > 1e4 or all zeros
+
     // helpers for GPU offloading
     std::vector<float> inp_mel;
     std::vector<float> inp_mask;
@@ -1961,6 +1965,29 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
     return true;
 }
 
+// A GPU that silently fails hands back NaN/Inf, absurd values or untouched
+// zeros, and the decoder then emits token 0 ("!") for the whole window.
+// Healthy large-v3-turbo output stays within |x| < 20; above 1e4 the decoder's
+// f16 math can overflow into NaN, which would otherwise look like a decoder
+// fault. Bit test rather than std::isfinite so fast-math cannot fold it away.
+static bool whisper_embd_enc_ok(const ggml_tensor * t) {
+    if (!t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+        return true; // external encoders write host memory; nothing to read cheaply otherwise
+    }
+    const float * x = (const float *) t->data;
+    bool any_nonzero = false;
+    for (int64_t i = 0, n = ggml_nelements(t); i < n; ++i) {
+        uint32_t bits;
+        memcpy(&bits, &x[i], sizeof(bits));
+        bits &= 0x7fffffffu;
+        if (bits > 0x461c4000u) { // NaN, Inf or |x| > 1e4
+            return false;
+        }
+        any_nonzero |= bits != 0;
+    }
+    return any_nonzero;
+}
+
 static bool whisper_encode_external(const whisper_state & wstate) {
     GGML_UNUSED(wstate);
 
@@ -2418,8 +2445,13 @@ static bool whisper_encode_internal(
 #if defined(WHISPER_USE_COREML)
             whisper_coreml_encode(wstate.ctx_coreml, mel->ne[0], mel->ne[1], (float *) mel->data, (float *) wstate.embd_enc->data);
 #elif defined(WHISPER_USE_OPENVINO)
-            whisper_openvino_encode(wstate.ctx_openvino, mel, wstate.embd_enc);
+            if (!whisper_openvino_encode(wstate.ctx_openvino, mel, wstate.embd_enc)) {
+                wstate.n_encode_ext_failed++;
+            }
 #endif
+            if (!whisper_embd_enc_ok(wstate.embd_enc)) {
+                wstate.n_encode_ext_bad++;
+            }
         }
     }
 
@@ -4168,6 +4200,14 @@ float * whisper_get_logits(struct whisper_context * ctx) {
 
 float * whisper_get_logits_from_state(struct whisper_state * state) {
     return state->logits.data();
+}
+
+int whisper_n_encode_ext_failed(struct whisper_context * ctx) {
+    return ctx->state ? ctx->state->n_encode_ext_failed : 0;
+}
+
+int whisper_n_encode_ext_bad(struct whisper_context * ctx) {
+    return ctx->state ? ctx->state->n_encode_ext_bad : 0;
 }
 
 const char * whisper_token_to_str(struct whisper_context * ctx, whisper_token token) {
