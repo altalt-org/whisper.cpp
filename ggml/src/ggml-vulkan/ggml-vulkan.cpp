@@ -5813,11 +5813,11 @@ static void ggml_vk_instance_init() {
             }
         }
 
-        // If no GPUs found, fall back to the first non-CPU device.
-        // If only CPU devices are available, return without devices.
+        // If no GPUs found, fall back to the first supported non-CPU device.
+        // If only CPU or unsupported devices are available, return without devices.
         if (vk_instance.device_indices.empty()) {
             for (size_t i = 0; i < devices.size(); i++) {
-                if (devices[i].getProperties().deviceType != vk::PhysicalDeviceType::eCpu) {
+                if (devices[i].getProperties().deviceType != vk::PhysicalDeviceType::eCpu && ggml_vk_device_is_supported(devices[i])) {
                     vk_instance.device_indices.push_back(i);
                     break;
                 }
@@ -15601,10 +15601,18 @@ static bool ggml_vk_instance_debug_utils_ext_available(
 }
 
 static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
+    // A pre-1.2 driver ignores VkPhysicalDeviceVulkan11Features and leaves it
+    // unwritten, so the answer would be stack garbage. ggml_vk_get_device()
+    // then reads its own garbage and throws "Unsupported device" through the
+    // C API, which aborts the process.
+    if (vkdev.getProperties().apiVersion < VK_API_VERSION_1_2) {
+        return false;
+    }
+
     VkPhysicalDeviceFeatures2 device_features2;
     device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 
-    VkPhysicalDeviceVulkan11Features vk11_features;
+    VkPhysicalDeviceVulkan11Features vk11_features = {};
     vk11_features.pNext = nullptr;
     vk11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     device_features2.pNext = &vk11_features;
