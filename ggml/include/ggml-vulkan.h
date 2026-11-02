@@ -24,6 +24,17 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
+// How listing the physical devices went when the backend was initialised.
+// incomplete_count > 0 means a driver layer kept reporting fewer devices than
+// it returned and the list may be partial (Alt #1669); layers then names the
+// instance layers, comma-separated. All zero/empty before initialisation.
+struct ggml_vk_enum_info {
+    uint32_t     incomplete_count;
+    uint32_t     device_count;
+    const char * layers;
+};
+GGML_BACKEND_API struct ggml_vk_enum_info ggml_backend_vk_get_enum_info(void);
+
 #ifdef  __cplusplus
 }
 #endif

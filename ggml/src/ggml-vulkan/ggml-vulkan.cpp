@@ -2042,6 +2042,11 @@ struct vk_instance_t {
     std::vector<size_t> device_indices;
     std::vector<bool>   device_supports_membudget;
     vk_device devices[GGML_VK_MAX_DEVICES];
+
+    // Listed once by ggml_vk_instance_init(), see ggml_vk_enumerate_physical_devices()
+    std::vector<vk::PhysicalDevice> physical_devices;
+    uint32_t    enum_incomplete_count = 0;
+    std::string enum_layers;  // filled only when the list came back incomplete
 };
 
 static bool vk_instance_initialized = false;
@@ -4733,7 +4738,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         size_t dev_num = vk_instance.device_indices[idx];
 
-        std::vector<vk::PhysicalDevice> physical_devices = vk_instance.instance.enumeratePhysicalDevices();
+        std::vector<vk::PhysicalDevice> physical_devices = vk_instance.physical_devices;
 
         if (dev_num >= physical_devices.size()) {
             std::cerr << "ggml_vulkan: Device with index " << dev_num << " does not exist." << std::endl;
@@ -5493,7 +5498,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_print_gpu_info(" << dev_num << ")");
     GGML_ASSERT(vk_instance_initialized);
 
-    std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
+    std::vector<vk::PhysicalDevice> devices = vk_instance.physical_devices;
 
     if (dev_num >= devices.size()) {
         std::cerr << "ggml_vulkan: Device with index " << dev_num << " does not exist." << std::endl;
@@ -5655,6 +5660,50 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
     return ggml_vk_default_dispatcher_instance;
 }
 
+// Vulkan-Hpp's enumeratePhysicalDevices() asks again for as long as the fill
+// returns VK_INCOMPLETE. On some hybrid laptops (AMD iGPU + NVIDIA, with both
+// vendors' implicit layers) the count query reports one device fewer than the
+// fill finds, so every retry is VK_INCOMPLETE and the process hangs (Alt
+// #1669). Retry a few times, then keep what the fill returned: the loader hands
+// those devices out valid even with VK_INCOMPLETE.
+static std::vector<vk::PhysicalDevice> ggml_vk_enumerate_physical_devices() {
+    std::vector<vk::PhysicalDevice> devices;
+    vk::Result result = vk::Result::eIncomplete;
+    for (int attempt = 0; attempt < 8 && result == vk::Result::eIncomplete; attempt++) {
+        uint32_t count = 0;
+        result = vk_instance.instance.enumeratePhysicalDevices(&count, nullptr);
+        if (result == vk::Result::eSuccess && count > 0) {
+            devices.resize(count);
+            result = vk_instance.instance.enumeratePhysicalDevices(&count, devices.data());
+            devices.resize(count);
+        }
+        if (result == vk::Result::eIncomplete) {
+            vk_instance.enum_incomplete_count++;
+        }
+    }
+    if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
+        throw vk::SystemError(vk::make_error_code(result), "vkEnumeratePhysicalDevices");
+    }
+    if (result == vk::Result::eIncomplete) {
+        GGML_LOG_WARN("ggml_vulkan: vkEnumeratePhysicalDevices kept returning VK_INCOMPLETE, using %zu device(s)\n", devices.size());
+        // Name the instance layers for diagnostics; the culprit is one of them.
+        uint32_t n = 0;
+        if (vk::enumerateInstanceLayerProperties(&n, nullptr) == vk::Result::eSuccess) {
+            std::vector<vk::LayerProperties> layers(n);
+            if (vk::enumerateInstanceLayerProperties(&n, layers.data()) != vk::Result::eSuccess) {
+                layers.resize(std::min<size_t>(n, layers.size()));
+            }
+            for (const auto & layer : layers) {
+                if (!vk_instance.enum_layers.empty()) {
+                    vk_instance.enum_layers += ",";
+                }
+                vk_instance.enum_layers += layer.layerName.data();
+            }
+        }
+    }
+    return devices;
+}
+
 static void ggml_vk_instance_init() {
     if (vk_instance_initialized) {
         return;
@@ -5744,7 +5793,8 @@ static void ggml_vk_instance_init() {
     // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
     VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance);
 
-    std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
+    vk_instance.physical_devices = ggml_vk_enumerate_physical_devices();
+    std::vector<vk::PhysicalDevice> devices = vk_instance.physical_devices;
 
     // Emulate behavior of CUDA_VISIBLE_DEVICES for Vulkan
     char * devices_env = getenv("GGML_VK_VISIBLE_DEVICES");
@@ -13337,7 +13387,7 @@ static int ggml_vk_get_device_count() {
 static void ggml_vk_get_device_description(int device, char * description, size_t description_size) {
     ggml_vk_instance_init();
 
-    std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
+    std::vector<vk::PhysicalDevice> devices = vk_instance.physical_devices;
 
     vk::PhysicalDeviceProperties props;
     devices[device].getProperties(&props);
@@ -14946,7 +14996,7 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
 
-    vk::PhysicalDevice vkdev = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
+    vk::PhysicalDevice vkdev = vk_instance.physical_devices[vk_instance.device_indices[device]];
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgetprops;
     vk::PhysicalDeviceMemoryProperties2 memprops = {};
     const bool membudget_supported = vk_instance.device_supports_membudget[device];
@@ -14978,7 +15028,7 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
 static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
     GGML_ASSERT(device_idx >= 0 && device_idx < (int) vk_instance.device_indices.size());
 
-    vk::PhysicalDevice device = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device_idx]];
+    vk::PhysicalDevice device = vk_instance.physical_devices[vk_instance.device_indices[device_idx]];
 
     vk::PhysicalDeviceProperties2 props = {};
     device.getProperties2(&props);
@@ -14989,7 +15039,7 @@ static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
 static std::string ggml_backend_vk_get_device_pci_id(int device_idx) {
     GGML_ASSERT(device_idx >= 0 && device_idx < (int) vk_instance.device_indices.size());
 
-    vk::PhysicalDevice device = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device_idx]];
+    vk::PhysicalDevice device = vk_instance.physical_devices[vk_instance.device_indices[device_idx]];
 
     const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
 
@@ -15822,12 +15872,25 @@ static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_proc_address = */ NULL,
 };
 
+struct ggml_vk_enum_info ggml_backend_vk_get_enum_info(void) {
+    return {
+        vk_instance.enum_incomplete_count,
+        (uint32_t) vk_instance.physical_devices.size(),
+        vk_instance.enum_layers.c_str(),
+    };
+}
+
 ggml_backend_reg_t ggml_backend_vk_reg() {
     static ggml_backend_reg reg = {
         /* .api_version = */ GGML_BACKEND_API_VERSION,
         /* .iface       = */ ggml_backend_vk_reg_i,
         /* .context     = */ nullptr,
     };
+    // Lets the host keep Vulkan out of a process where it hung or crashed
+    // before (Alt #1669); the CPU backend is used instead.
+    if (getenv("GGML_VK_DISABLE") != nullptr) {
+        return nullptr;
+    }
     try {
         ggml_vk_instance_init();
         return &reg;

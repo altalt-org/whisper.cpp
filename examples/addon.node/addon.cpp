@@ -4,6 +4,9 @@
 
 #include "whisper.h"
 #include "ggml-backend.h"
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
 
 #include <string>
 #include <thread>
@@ -1362,6 +1365,23 @@ Napi::Value GetGpuDevices(const Napi::CallbackInfo& info) {
     }
 }
 
+// How the Vulkan backend's device listing went (Alt #1669), or null when the
+// build has no Vulkan. Call after getGpuDevices(): it does not initialise the
+// backend itself.
+Napi::Value GetVulkanDiagnostics(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+#ifdef GGML_USE_VULKAN
+    const ggml_vk_enum_info vk = ggml_backend_vk_get_enum_info();
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("incompleteCount", Napi::Number::New(env, vk.incomplete_count));
+    result.Set("deviceCount", Napi::Number::New(env, vk.device_count));
+    result.Set("layers", Napi::String::New(env, vk.layers ? vk.layers : ""));
+    return result;
+#else
+    return env.Null();
+#endif
+}
+
 // ============================================================================
 // Module initialization
 // ============================================================================
@@ -1409,6 +1429,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 
     // Export GPU device enumeration function
     exports.Set("getGpuDevices", Napi::Function::New(env, GetGpuDevices));
+    exports.Set("getVulkanDiagnostics", Napi::Function::New(env, GetVulkanDiagnostics));
 
     return exports;
 }
