@@ -495,6 +495,16 @@ extern "C" {
                              float * logits,
                               void * user_data);
 
+    // Language select callback
+    // Auto language only: called once with the first window's language probabilities
+    // (whisper_lang_max_id() + 1 values). Returns the language id to decode in, or -1
+    // for the most likely one.
+    typedef int (*whisper_lang_select_callback)(
+            struct whisper_context * ctx,
+              struct whisper_state * state,
+                       const float * lang_probs,
+                              void * user_data);
+
     // Parameters for the whisper_full() function
     // If you change the order or add new parameters, make sure to update the default values in whisper.cpp:
     // whisper_full_default_params()
@@ -602,6 +612,14 @@ extern "C" {
         const char * vad_model_path;              // Path to VAD model
 
         whisper_vad_params vad_params;
+
+        // Language probabilities of the first 30 s window, read from the encoder run
+        // the transcription does anyway. If not NULL, filled with
+        // whisper_lang_max_id() + 1 values, also when the language is set.
+        float * lang_probs;
+
+        whisper_lang_select_callback lang_select_callback;
+        void * lang_select_callback_user_data;
     };
 
     // NOTE: this function allocates memory, and it is the responsibility of the caller to free the pointer - see whisper_free_context_params & whisper_free_params()

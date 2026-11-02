@@ -4022,6 +4022,12 @@ const char * whisper_lang_str_full(int id) {
     return nullptr;
 }
 
+static int whisper_lang_probs_from_encoder(
+        struct whisper_context * ctx,
+          struct whisper_state * state,
+                           int   n_threads,
+                         float * lang_probs);
+
 int whisper_lang_auto_detect_with_state(
         struct whisper_context * ctx,
           struct whisper_state * state,
@@ -4046,6 +4052,15 @@ int whisper_lang_auto_detect_with_state(
         return -6;
     }
 
+    return whisper_lang_probs_from_encoder(ctx, state, n_threads, lang_probs);
+}
+
+// Language probabilities from the encoder output already in state: one decoder step.
+static int whisper_lang_probs_from_encoder(
+        struct whisper_context * ctx,
+          struct whisper_state * state,
+                           int   n_threads,
+                         float * lang_probs) {
     const std::vector<whisper_token> prompt = { whisper_token_sot(ctx) };
 
     if (whisper_decode_with_state(ctx, state, prompt.data(), prompt.size(), 0, n_threads) != 0) {
@@ -4058,7 +4073,15 @@ int whisper_lang_auto_detect_with_state(
 
     for (const auto & kv : g_lang) {
         const auto token_lang = whisper_token_lang(ctx, kv.second.first);
-        logits_id.emplace_back(state->logits[token_lang], kv.second.first);
+        float logit = state->logits[token_lang];
+        // A bad encoder run gives NaN, which would break the sort below. Bit
+        // test, so fast math cannot fold it away.
+        uint32_t bits;
+        memcpy(&bits, &logit, sizeof(bits));
+        if ((bits & 0x7fffffffu) > 0x7f800000u) {
+            logit = -INFINITY;
+        }
+        logits_id.emplace_back(logit, kv.second.first);
     }
 
     // sort descending
@@ -6058,6 +6081,10 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
         /*.vad_model_path              =*/ nullptr,
 
         /* vad_params =*/ whisper_vad_default_params(),
+
+        /*.lang_probs                     =*/ nullptr,
+        /*.lang_select_callback           =*/ nullptr,
+        /*.lang_select_callback_user_data =*/ nullptr,
     };
 
     switch (strategy) {
@@ -6868,8 +6895,13 @@ int whisper_full_with_state(
         }
     }
 
+    // Auto language on a multilingual model is detected in the main loop from the
+    // first window's encoder run, so that window is not encoded twice.
+    const bool auto_language = params.language == nullptr || strlen(params.language) == 0 || strcmp(params.language, "auto") == 0;
+    const bool detect_in_loop = auto_language && !params.detect_language && whisper_is_multilingual(ctx);
+
     // auto-detect language if not specified
-    if (params.language == nullptr || strlen(params.language) == 0 || strcmp(params.language, "auto") == 0 || params.detect_language) {
+    if ((auto_language || params.detect_language) && !detect_in_loop) {
         std::vector<float> probs(whisper_lang_max_id() + 1, 0.0f);
 
         const auto lang_id = whisper_lang_auto_detect_with_state(ctx, state, 0, params.n_threads, probs.data());
@@ -6881,6 +6913,9 @@ int whisper_full_with_state(
         params.language = whisper_lang_str(lang_id);
 
         WHISPER_LOG_INFO("%s: auto-detected language: %s (p = %f)\n", __func__, params.language, probs[whisper_lang_id(params.language)]);
+        if (params.lang_probs) {
+            std::copy(probs.begin(), probs.end(), params.lang_probs);
+        }
         if (params.detect_language) {
             return 0;
         }
@@ -7014,7 +7049,8 @@ int whisper_full_with_state(
     std::vector<whisper_token> prompt_init = { whisper_token_sot(ctx), };
 
     if (whisper_is_multilingual(ctx)) {
-        const int lang_id = whisper_lang_id(params.language);
+        // detect_in_loop: a placeholder until the first window is encoded
+        const int lang_id = detect_in_loop ? 0 : whisper_lang_id(params.language);
         state->lang_id = lang_id;
         prompt_init.push_back(whisper_token_lang(ctx, lang_id));
         if (params.translate) {
@@ -7038,6 +7074,7 @@ int whisper_full_with_state(
     }
 
     int seek = seek_start;
+    bool lang_measured = false;
 
     std::vector<whisper_token> prompt;
     prompt.reserve(whisper_n_text_ctx(ctx));
@@ -7080,6 +7117,32 @@ int whisper_full_with_state(
         if (!whisper_encode_internal(*ctx, *state, seek, params.n_threads, params.abort_callback, params.abort_callback_user_data)) {
             WHISPER_LOG_ERROR("%s: failed to encode\n", __func__);
             return -6;
+        }
+
+        // first window: language probabilities from this encoder run
+        if (!lang_measured && (detect_in_loop || (params.lang_probs && whisper_is_multilingual(ctx)))) {
+            lang_measured = true;
+            std::vector<float> probs(whisper_lang_max_id() + 1, 0.0f);
+            int lang_id = whisper_lang_probs_from_encoder(ctx, state, params.n_threads, probs.data());
+            if (detect_in_loop) {
+                if (lang_id < 0) {
+                    WHISPER_LOG_ERROR("%s: failed to auto-detect language\n", __func__);
+                    return -3;
+                }
+                if (params.lang_select_callback) {
+                    const int picked = params.lang_select_callback(ctx, state, probs.data(), params.lang_select_callback_user_data);
+                    if (picked >= 0 && picked <= whisper_lang_max_id()) {
+                        lang_id = picked;
+                    }
+                }
+                state->lang_id = lang_id;
+                params.language = whisper_lang_str(lang_id);
+                prompt_init[1] = whisper_token_lang(ctx, lang_id);
+                WHISPER_LOG_INFO("%s: auto-detected language: %s (p = %f)\n", __func__, params.language, probs[lang_id]);
+            }
+            if (params.lang_probs && lang_id >= 0) {
+                std::copy(probs.begin(), probs.end(), params.lang_probs);
+            }
         }
 
         // if there is a very short audio segment left to process, we remove any past prompt since it tends
