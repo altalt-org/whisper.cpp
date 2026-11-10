@@ -4063,6 +4063,11 @@ static int whisper_lang_probs_from_encoder(
                          float * lang_probs) {
     const std::vector<whisper_token> prompt = { whisper_token_sot(ctx) };
 
+    // Zero the KV cache first. Freed cells keep their values and still enter the
+    // attention as 0 * value, so NaN left by a bad window would turn every
+    // language logit into NaN (and auto language into "af") on the next call.
+    whisper_kv_cache_clear(state->kv_self);
+
     if (whisper_decode_with_state(ctx, state, prompt.data(), prompt.size(), 0, n_threads) != 0) {
         WHISPER_LOG_ERROR("%s: failed to decode\n", __func__);
         return -7;
